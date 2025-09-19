@@ -584,11 +584,6 @@ export default class RegexSearchPlugin extends Plugin {
 
 		// 添加设置选项卡
 		this.addSettingTab(new RegexSearchSettingTab(this.app, this));
-
-		// 添加状态栏项目
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Regex Search');
-		statusBarItemEl.addClass('regex-search-statusbar');
 	}
 
 	onunload() {
@@ -2427,16 +2422,7 @@ class RegexLibraryModal extends Modal {
 		const json = this.plugin.exportRegexLibrary();
 		navigator.clipboard.writeText(json).then(() => {
 			new Notice('正则表达式库已复制到剪贴板');
-		}).catch(() => {
-			// 创建一个临时文本区域
-			const textarea = document.createElement('textarea');
-			textarea.value = json;
-			document.body.appendChild(textarea);
-			textarea.select();
-			document.execCommand('copy');
-			document.body.removeChild(textarea);
-			new Notice('正则表达式库已复制到剪贴板');
-		});
+		})
 	}
 
 	onClose() {
@@ -2724,11 +2710,9 @@ class RegexSearchSettingTab extends PluginSettingTab {
 		this.plugin = plugin;
 	}
 
-	display(): void {
+		display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-
-		containerEl.createEl('h2', { text: '🎯 正则表达式搜索设置' });
 
 		// 基本设置
 		this.createBasicSettings(containerEl);
@@ -2744,7 +2728,7 @@ class RegexSearchSettingTab extends PluginSettingTab {
 	}
 
 	private createBasicSettings(containerEl: HTMLElement) {
-		const basicSection = containerEl.createEl('h3', { text: '⚙️ 基本设置' });
+		new Setting(containerEl).setName('⚙️ 基本设置').setHeading();
 
 		new Setting(containerEl)
 			.setName('默认搜索模式')
@@ -2820,7 +2804,7 @@ class RegexSearchSettingTab extends PluginSettingTab {
 	}
 
 	private createAdvancedSettings(containerEl: HTMLElement) {
-		const advancedSection = containerEl.createEl('h3', { text: '🔧 高级设置' });
+		new Setting(containerEl).setName('🔧 高级设置').setHeading();
 
 		new Setting(containerEl)
 			.setName('包含隐藏文件')
@@ -2856,7 +2840,7 @@ class RegexSearchSettingTab extends PluginSettingTab {
 	}
 
 	private createPerformanceSettings(containerEl: HTMLElement) {
-		const performanceSection = containerEl.createEl('h3', { text: '⚡ 性能设置' });
+		new Setting(containerEl).setName('⚡ 性能设置').setHeading();
 
 		new Setting(containerEl)
 			.setName('每个文件最大结果数')
@@ -2874,7 +2858,7 @@ class RegexSearchSettingTab extends PluginSettingTab {
 	}
 
 	private createUserExperienceSettings(containerEl: HTMLElement) {
-		const uxSection = containerEl.createEl('h3', { text: '🎨 用户体验设置' });
+		new Setting(containerEl).setName('🎨 用户体验设置').setHeading();
 
 		new Setting(containerEl)
 			.setName('启用搜索历史')

@@ -102,5 +102,6 @@ dist
 .tern-port
 
 # obsidian
+main.js
 data.json
 *.js.map
