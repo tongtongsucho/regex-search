@@ -473,19 +473,12 @@
 .regex-replace-success {
     text-align: center;
     padding: 20px;
-    color: var(--text-success);
+    color: var(--text-on-accent);
     font-weight: 600;
-    background: var(--background-modifier-success);
+    background: var(--text-success);
     border: 1px solid var(--text-success);
     border-radius: 8px;
     font-size: 16px;
-}
-
-.regex-replace-success::before {
-    content: "✅ ";
-    font-size: 24px;
-    display: block;
-    margin-bottom: 8px;
 }
 
 .regex-replace-success div {
