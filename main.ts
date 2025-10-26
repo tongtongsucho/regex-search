@@ -213,6 +213,35 @@ interface RegexLibraryItem {
 	usage: number; // 使用次数
 }
 
+// Pipeline 相关接口
+interface PipelineStage {
+	id: string;
+	name: string;
+	description: string;
+	pattern: string;
+	replacement: string;
+	flags: string;
+	enabled: boolean;
+}
+
+interface RegexPipeline {
+	id: string;
+	name: string;
+	description: string;
+	category: string;
+	stages: PipelineStage[];
+	createdAt: number;
+	lastModified: number;
+	usage: number;
+}
+
+interface PipelineExecutionResult {
+	filesModified: number;
+	totalReplacements: number;
+	processingTime: number;
+	errors: string[];
+}
+
 // 接口定义
 interface RegexSearchSettings {
 	defaultPattern: string;
@@ -229,6 +258,7 @@ interface RegexSearchSettings {
 	enableDebugLogging: boolean;
 	regexLibrary: RegexLibraryItem[];
 	enableRegexLibrary: boolean;
+	regexPipelines: RegexPipeline[];
 }
 
 const DEFAULT_SETTINGS: RegexSearchSettings = {
@@ -245,6 +275,7 @@ const DEFAULT_SETTINGS: RegexSearchSettings = {
 	excludePatterns: [],
 	enableDebugLogging: false,
 	regexLibrary: [],
+	regexPipelines: [],
 	enableRegexLibrary: true
 };
 
@@ -584,6 +615,15 @@ export default class RegexSearchPlugin extends Plugin {
 			name: '管理正则表达式库',
 			callback: () => {
 				new RegexLibraryModal(this.app, this).open();
+			}
+		});
+
+		// 添加 Pipeline 管理命令
+		this.addCommand({
+			id: 'manage-regex-pipelines',
+			name: '管理正则表达式 Pipeline',
+			callback: () => {
+				new RegexPipelineManagerModal(this.app, this).open();
 			}
 		});
 
@@ -1437,6 +1477,146 @@ export default class RegexSearchPlugin extends Plugin {
 		this.settings.searchHistory = [];
 		this.saveSettings();
 	}
+
+
+	// Pipeline 管理方法
+	getPipelinesByCategory(): Record<string, RegexPipeline[]> {
+		const result: Record<string, RegexPipeline[]> = {};
+		this.settings.regexPipelines.forEach(pipeline => {
+			if (!result[pipeline.category]) {
+				result[pipeline.category] = [];
+			}
+			result[pipeline.category].push(pipeline);
+		});
+		return result;
+	}
+
+	addPipeline(pipeline: RegexPipeline) {
+		this.settings.regexPipelines.push(pipeline);
+		this.saveSettings();
+	}
+
+	updatePipeline(pipeline: RegexPipeline) {
+		const index = this.settings.regexPipelines.findIndex(p => p.id === pipeline.id);
+		if (index !== -1) {
+			this.settings.regexPipelines[index] = pipeline;
+			this.saveSettings();
+		}
+	}
+
+	removePipeline(id: string) {
+		this.settings.regexPipelines = this.settings.regexPipelines.filter(p => p.id !== id);
+		this.saveSettings();
+	}
+
+	incrementPipelineUsage(id: string) {
+		const pipeline = this.settings.regexPipelines.find(p => p.id === id);
+		if (pipeline) {
+			pipeline.usage++;
+			this.saveSettings();
+		}
+	}
+
+	exportPipelines(): string {
+		return JSON.stringify(this.settings.regexPipelines, null, 2);
+	}
+
+	importPipelines(json: string): number {
+		try {
+			const imported = JSON.parse(json);
+			const pipelines = Array.isArray(imported) ? imported : [imported];
+			let count = 0;
+
+			pipelines.forEach(pipeline => {
+				if (pipeline.id && pipeline.name && pipeline.stages) {
+					// 避免 ID 冲突
+					const existingIds = new Set(this.settings.regexPipelines.map(p => p.id));
+					if (existingIds.has(pipeline.id)) {
+						pipeline.id = Date.now().toString() + Math.random();
+					}
+					this.settings.regexPipelines.push(pipeline);
+					count++;
+				}
+			});
+
+			this.saveSettings();
+			return count;
+		} catch (error) {
+			throw new Error('导入失败: ' + error.message);
+		}
+	}
+
+	async executePipelineInVault(
+		pipeline: RegexPipeline,
+		allFiles: boolean,
+		targetFile: TFile | null,
+		progressCallback?: (progress: { current: number; total: number; currentFile: string }) => void
+	): Promise<PipelineExecutionResult> {
+		const startTime = Date.now();
+		const result: PipelineExecutionResult = {
+			filesModified: 0,
+			totalReplacements: 0,
+			processingTime: 0,
+			errors: []
+		};
+
+		try {
+			const files = allFiles
+				? this.app.vault.getMarkdownFiles()
+				: targetFile
+				? [targetFile]
+				: [];
+
+			for (let i = 0; i < files.length; i++) {
+				const file = files[i];
+
+				if (progressCallback) {
+					progressCallback({
+						current: i + 1,
+						total: files.length,
+						currentFile: file.path
+					});
+				}
+
+				try {
+					let content = await this.app.vault.read(file);
+					const originalContent = content;
+					let fileReplacements = 0;
+
+					// 执行每个阶段
+					for (const stage of pipeline.stages) {
+						if (!stage.enabled) continue;
+
+						try {
+							const regex = new RegExp(stage.pattern, stage.flags);
+							const matches = content.match(regex);
+							if (matches) {
+								fileReplacements += matches.length;
+							}
+							content = content.replace(regex, stage.replacement);
+						} catch (error) {
+							result.errors.push(`${file.path} - 阶段 "${stage.name}": ${error.message}`);
+						}
+					}
+
+					// 如果内容有变化，保存文件
+					if (content !== originalContent) {
+						await this.app.vault.modify(file, content);
+						result.filesModified++;
+						result.totalReplacements += fileReplacements;
+					}
+				} catch (error) {
+					result.errors.push(`${file.path}: ${error.message}`);
+				}
+			}
+		} catch (error) {
+			result.errors.push(`执行失败: ${error.message}`);
+		}
+
+		result.processingTime = Date.now() - startTime;
+		return result;
+	}
+
 }
 
 // 快速搜索模态框
@@ -2637,84 +2817,6 @@ class RegexLibraryImportModal extends Modal {
 	}
 }
 
-// 确认对话框
-class ConfirmModal extends Modal {
-	private callback: (confirmed: boolean) => void;
-	private options: {
-		title: string;
-		message: string;
-		confirmText: string;
-		cancelText: string;
-	};
-
-	constructor(app: App, options: {
-		title: string;
-		message: string;
-		confirmText: string;
-		cancelText: string;
-	}, callback: (confirmed: boolean) => void) {
-		super(app);
-		this.options = options;
-		this.callback = callback;
-	}
-
-	onOpen() {
-		const { contentEl } = this;
-		contentEl.empty();
-		contentEl.addClass('confirm-modal');
-
-		// 标题
-		contentEl.createEl('h3', { text: this.options.title });
-
-		// 消息
-		const messageEl = contentEl.createEl('div', { cls: 'confirm-message' });
-		messageEl.createEl('p', { text: this.options.message });
-
-		// 按钮
-		const buttonContainer = contentEl.createDiv('confirm-buttons');
-		
-		const confirmButton = buttonContainer.createEl('button', { 
-			text: this.options.confirmText,
-			cls: 'confirm-button-confirm'
-		});
-		
-		const cancelButton = buttonContainer.createEl('button', { 
-			text: this.options.cancelText,
-			cls: 'confirm-button-cancel'
-		});
-
-		// 事件处理
-		confirmButton.addEventListener('click', () => {
-			this.callback(true);
-			this.close();
-		});
-
-		cancelButton.addEventListener('click', () => {
-			this.callback(false);
-			this.close();
-		});
-
-		// 键盘事件
-		this.scope.register([], 'Enter', () => {
-			this.callback(true);
-			this.close();
-		});
-
-		this.scope.register([], 'Escape', () => {
-			this.callback(false);
-			this.close();
-		});
-
-		// 默认焦点
-		cancelButton.focus();
-	}
-
-	onClose() {
-		const { contentEl } = this;
-		contentEl.empty();
-	}
-}
-
 // 设置页面
 class RegexSearchSettingTab extends PluginSettingTab {
 	plugin: RegexSearchPlugin;
@@ -2925,5 +3027,788 @@ class RegexSearchSettingTab extends PluginSettingTab {
 					this.plugin.clearSearchHistory();
 					new Notice('搜索历史已清空');
 				}));
+	}
+}
+
+// ===== Pipeline 功能实现 =====
+
+// 确认对话框
+class ConfirmModal extends Modal {
+	private callback: (confirmed: boolean) => void;
+	private options: {
+		title: string;
+		message: string;
+		confirmText: string;
+		cancelText: string;
+	};
+	private resolved: boolean = false;
+
+	constructor(app: App, options: {
+		title: string;
+		message: string;
+		confirmText: string;
+		cancelText: string;
+	}, callback: (confirmed: boolean) => void) {
+		super(app);
+		this.options = options;
+		this.callback = callback;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.addClass('confirm-modal');
+
+		contentEl.createEl('h3', { text: this.options.title });
+
+		const messageEl = contentEl.createEl('div', { cls: 'confirm-message' });
+		const lines = this.options.message.split('\n');
+		lines.forEach(line => {
+			if (line.trim()) {
+				messageEl.createEl('p', { text: line });
+			}
+		});
+
+		const buttonContainer = contentEl.createDiv('confirm-buttons');
+
+		const cancelButton = buttonContainer.createEl('button', {
+			text: this.options.cancelText,
+			cls: 'confirm-button-cancel'
+		});
+
+		const confirmButton = buttonContainer.createEl('button', {
+			text: this.options.confirmText,
+			cls: 'confirm-button-confirm mod-cta'
+		});
+
+		confirmButton.onclick = () => {
+			if (!this.resolved) {
+				this.resolved = true;
+				this.callback(true);
+				this.close();
+			}
+		};
+
+		cancelButton.onclick = () => {
+			if (!this.resolved) {
+				this.resolved = true;
+				this.callback(false);
+				this.close();
+			}
+		};
+
+		setTimeout(() => {
+			cancelButton.focus();
+		}, 10);
+	}
+
+	onClose() {
+		const { contentEl } = this;
+		contentEl.empty();
+		if (!this.resolved) {
+			this.resolved = true;
+			this.callback(false);
+		}
+	}
+}
+
+// Pipeline 管理器 Modal
+class RegexPipelineManagerModal extends Modal {
+	plugin: RegexSearchPlugin;
+	pipelineListContainer: HTMLElement;
+
+	constructor(app: App, plugin: RegexSearchPlugin) {
+		super(app);
+		this.plugin = plugin;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.addClass('regex-pipeline-manager-modal');
+
+		contentEl.createEl('h2', { text: '正则表达式 Pipeline 管理器' });
+
+		const buttonContainer = contentEl.createDiv('regex-pipeline-buttons');
+
+		buttonContainer.createEl('button', { text: '➕ 新建 Pipeline' }, (btn) => {
+			btn.onclick = () => this.createNewPipeline();
+		});
+
+		buttonContainer.createEl('button', { text: '📥 导入' }, (btn) => {
+			btn.onclick = () => this.showImportDialog();
+		});
+
+		buttonContainer.createEl('button', { text: '📤 导出' }, (btn) => {
+			btn.onclick = () => this.exportPipelines();
+		});
+
+		this.pipelineListContainer = contentEl.createDiv('regex-pipeline-list');
+		this.renderPipelines();
+
+		// 添加关闭按钮
+		const closeButtonContainer = contentEl.createDiv('regex-pipeline-close-container');
+		closeButtonContainer.style.marginTop = '20px';
+		closeButtonContainer.style.textAlign = 'right';
+
+		const closeButton = closeButtonContainer.createEl('button', { text: '关闭' });
+		closeButton.addClass('mod-cta');
+		closeButton.onclick = () => {
+			this.close();
+		};
+	}
+
+	renderPipelines() {
+		this.pipelineListContainer.empty();
+
+		if (this.plugin.settings.regexPipelines.length === 0) {
+			this.pipelineListContainer.createEl('p', {
+				text: '暂无 Pipeline。点击上方"➕ 新建 Pipeline"创建您的第一个正则表达式处理流程。',
+				cls: 'regex-empty-message'
+			});
+			return;
+		}
+
+		const pipelinesByCategory = this.plugin.getPipelinesByCategory();
+
+		Object.keys(pipelinesByCategory).forEach(category => {
+			const categorySection = this.pipelineListContainer.createDiv('regex-category-section');
+			categorySection.createEl('h3', { text: category });
+
+			const pipelineList = categorySection.createDiv('regex-pipeline-items');
+
+			pipelinesByCategory[category].forEach(pipeline => {
+				const item = pipelineList.createDiv('regex-pipeline-item');
+
+				const info = item.createDiv('regex-pipeline-info');
+				info.createEl('strong', { text: pipeline.name });
+				info.createEl('p', { text: pipeline.description, cls: 'regex-pipeline-desc' });
+				info.createEl('small', {
+					text: `${pipeline.stages.length} 个阶段 | 使用次数: ${pipeline.usage}`,
+					cls: 'regex-pipeline-meta'
+				});
+
+				const actions = item.createDiv('regex-pipeline-actions');
+
+				actions.createEl('button', { text: '▶️ 执行', cls: 'mod-cta' }, (btn) => {
+					btn.onclick = () => this.executePipeline(pipeline);
+				});
+
+				actions.createEl('button', { text: '✏️ 编辑' }, (btn) => {
+					btn.onclick = () => this.editPipeline(pipeline);
+				});
+
+				actions.createEl('button', { text: '🗑️ 删除', cls: 'mod-warning' }, (btn) => {
+					btn.onclick = () => this.deletePipeline(pipeline);
+				});
+			});
+		});
+	}
+
+	createNewPipeline() {
+		new RegexPipelineEditorModal(this.app, this.plugin, null, () => {
+			this.renderPipelines();
+		}).open();
+	}
+
+	editPipeline(pipeline: RegexPipeline) {
+		new RegexPipelineEditorModal(this.app, this.plugin, pipeline, () => {
+			this.renderPipelines();
+		}).open();
+	}
+
+	executePipeline(pipeline: RegexPipeline) {
+		new RegexPipelineExecutionModal(this.app, this.plugin, pipeline).open();
+	}
+
+	deletePipeline(pipeline: RegexPipeline) {
+		new ConfirmModal(this.app, {
+			title: '确认删除',
+			message: `确定要删除 Pipeline "${pipeline.name}" 吗？此操作无法撤销。`,
+			confirmText: '删除',
+			cancelText: '取消'
+		}, (confirmed) => {
+			if (confirmed) {
+				this.plugin.removePipeline(pipeline.id);
+				this.renderPipelines();
+				new Notice('Pipeline 已删除');
+			}
+		}).open();
+	}
+
+	showImportDialog() {
+		new RegexPipelineImportModal(this.app, this.plugin, () => {
+			this.renderPipelines();
+		}).open();
+	}
+
+	exportPipelines() {
+		const json = this.plugin.exportPipelines();
+		navigator.clipboard.writeText(json).then(() => {
+			new Notice('Pipeline 已复制到剪贴板');
+		});
+	}
+
+	onClose() {
+		const { contentEl } = this;
+		contentEl.empty();
+	}
+}
+
+// Pipeline 编辑器 Modal
+class RegexPipelineEditorModal extends Modal {
+	plugin: RegexSearchPlugin;
+	pipeline: RegexPipeline | null;
+	callback: () => void;
+	stages: PipelineStage[] = [];
+
+	constructor(app: App, plugin: RegexSearchPlugin, pipeline: RegexPipeline | null, callback: () => void) {
+		super(app);
+		this.plugin = plugin;
+		this.pipeline = pipeline;
+		this.callback = callback;
+
+		if (pipeline) {
+			this.stages = JSON.parse(JSON.stringify(pipeline.stages)); // 深拷贝
+		}
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.addClass('regex-pipeline-editor-modal');
+
+		contentEl.createEl('h2', { text: this.pipeline ? '编辑 Pipeline' : '新建 Pipeline' });
+
+		const nameInput = contentEl.createEl('input', {
+			type: 'text',
+			placeholder: 'Pipeline 名称',
+			value: this.pipeline?.name || ''
+		});
+		nameInput.addClass('regex-input-full');
+
+		const descInput = contentEl.createEl('textarea', {
+			placeholder: 'Pipeline 描述'
+		});
+		descInput.addClass('regex-input-full');
+		descInput.value = this.pipeline?.description || '';
+
+		const categoryInput = contentEl.createEl('input', {
+			type: 'text',
+			placeholder: '分类（例如：文本处理、Markdown 优化）',
+			value: this.pipeline?.category || '自定义'
+		});
+		categoryInput.addClass('regex-input-full');
+
+		contentEl.createEl('h3', { text: 'Pipeline 阶段' });
+
+		const stagesContainer = contentEl.createDiv('regex-pipeline-stages');
+
+		const renderStages = () => {
+			stagesContainer.empty();
+
+			if (this.stages.length === 0) {
+				stagesContainer.createEl('p', { text: '暂无阶段，点击下方"添加阶段"按钮开始。' });
+			} else {
+				this.stages.forEach((stage, index) => {
+					const stageItem = stagesContainer.createDiv('regex-pipeline-stage-item');
+
+					const stageHeader = stageItem.createDiv('regex-stage-header');
+					stageHeader.createEl('strong', { text: `阶段 ${index + 1}` });
+
+					const stageActions = stageHeader.createDiv('regex-stage-actions');
+
+					if (index > 0) {
+						stageActions.createEl('button', { text: '↑' }, (btn) => {
+							btn.onclick = () => {
+								[this.stages[index - 1], this.stages[index]] = [this.stages[index], this.stages[index - 1]];
+								renderStages();
+							};
+						});
+					}
+
+					if (index < this.stages.length - 1) {
+						stageActions.createEl('button', { text: '↓' }, (btn) => {
+							btn.onclick = () => {
+								[this.stages[index], this.stages[index + 1]] = [this.stages[index + 1], this.stages[index]];
+								renderStages();
+							};
+						});
+					}
+
+					stageActions.createEl('button', { text: '✏️' }, (btn) => {
+						btn.onclick = () => {
+							new RegexPipelineStageEditorModal(this.app, this.plugin, stage, (updatedStage) => {
+								this.stages[index] = updatedStage;
+								renderStages();
+							}).open();
+						};
+					});
+
+					stageActions.createEl('button', { text: '🗑️', cls: 'mod-warning' }, (btn) => {
+						btn.onclick = () => {
+							this.stages.splice(index, 1);
+							renderStages();
+						};
+					});
+
+					const stageInfo = stageItem.createDiv('regex-stage-info');
+					stageInfo.createEl('div', { text: stage.name, cls: 'regex-stage-name' });
+					stageInfo.createEl('div', { text: stage.description, cls: 'regex-stage-desc' });
+					stageInfo.createEl('code', { text: `/${stage.pattern}/${stage.flags} → ${stage.replacement}`, cls: 'regex-stage-pattern' });
+				});
+			}
+		};
+
+		renderStages();
+
+		const addStageBtn = contentEl.createEl('button', { text: '➕ 添加阶段', cls: 'mod-cta' });
+		addStageBtn.onclick = () => {
+			new RegexPipelineStageEditorModal(this.app, this.plugin, null, (newStage) => {
+				this.stages.push(newStage);
+				renderStages();
+			}).open();
+		};
+
+		// 添加按钮容器
+		const buttonContainer = contentEl.createDiv('regex-pipeline-editor-buttons');
+		buttonContainer.style.marginTop = '20px';
+		buttonContainer.style.display = 'flex';
+		buttonContainer.style.justifyContent = 'flex-end';
+		buttonContainer.style.gap = '10px';
+
+		const cancelBtn = buttonContainer.createEl('button', { text: '取消' });
+		cancelBtn.onclick = () => {
+			this.close();
+		};
+
+		const saveBtn = buttonContainer.createEl('button', { text: '💾 保存 Pipeline', cls: 'mod-cta' });
+		saveBtn.onclick = () => {
+			const name = nameInput.value.trim();
+			const description = descInput.value.trim();
+			const category = categoryInput.value.trim();
+
+			if (!name) {
+				new Notice('请输入 Pipeline 名称');
+				return;
+			}
+
+			if (this.stages.length === 0) {
+				new Notice('请至少添加一个阶段');
+				return;
+			}
+
+			const pipelineData: RegexPipeline = {
+				id: this.pipeline?.id || Date.now().toString(),
+				name,
+				description,
+				category: category || '自定义',
+				stages: this.stages,
+				createdAt: this.pipeline?.createdAt || Date.now(),
+				lastModified: Date.now(),
+				usage: this.pipeline?.usage || 0
+			};
+
+			if (this.pipeline) {
+				this.plugin.updatePipeline(pipelineData);
+			} else {
+				this.plugin.addPipeline(pipelineData);
+			}
+
+			new Notice(`Pipeline "${name}" 已保存`);
+			this.callback();
+			this.close();
+		};
+	}
+
+	onClose() {
+		const { contentEl } = this;
+		contentEl.empty();
+	}
+}
+
+// Pipeline 阶段编辑器 Modal
+class RegexPipelineStageEditorModal extends Modal {
+	plugin: RegexSearchPlugin;
+	stage: PipelineStage | null;
+	callback: (stage: PipelineStage) => void;
+
+	constructor(app: App, plugin: RegexSearchPlugin, stage: PipelineStage | null, callback: (stage: PipelineStage) => void) {
+		super(app);
+		this.plugin = plugin;
+		this.stage = stage;
+		this.callback = callback;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.addClass('regex-pipeline-stage-editor-modal');
+
+		contentEl.createEl('h2', { text: this.stage ? '编辑阶段' : '新建阶段' });
+
+		const nameInput = contentEl.createEl('input', {
+			type: 'text',
+			placeholder: '阶段名称',
+			value: this.stage?.name || ''
+		});
+		nameInput.addClass('regex-input-full');
+
+		const descInput = contentEl.createEl('input', {
+			type: 'text',
+			placeholder: '阶段描述',
+			value: this.stage?.description || ''
+		});
+		descInput.addClass('regex-input-full');
+
+		const patternInput = contentEl.createEl('input', {
+			type: 'text',
+			placeholder: '正则表达式模式',
+			value: this.stage?.pattern || ''
+		});
+		patternInput.addClass('regex-input-full');
+
+		const replacementInput = contentEl.createEl('input', {
+			type: 'text',
+			placeholder: '替换文本（支持 $1, $2 等捕获组）',
+			value: this.stage?.replacement || ''
+		});
+		replacementInput.addClass('regex-input-full');
+
+		const flagsContainer = contentEl.createDiv('regex-flags-container');
+		flagsContainer.createEl('label', { text: '标志:' });
+
+		const flagsInput = flagsContainer.createEl('input', {
+			type: 'text',
+			placeholder: 'gimsu',
+			value: this.stage?.flags || 'g'
+		});
+		flagsInput.style.width = '100px';
+
+		// 添加按钮容器
+		const buttonContainer = contentEl.createDiv('regex-stage-editor-buttons');
+		buttonContainer.style.marginTop = '20px';
+		buttonContainer.style.display = 'flex';
+		buttonContainer.style.justifyContent = 'flex-end';
+		buttonContainer.style.gap = '10px';
+
+		const cancelBtn = buttonContainer.createEl('button', { text: '取消' });
+		cancelBtn.onclick = () => {
+			this.close();
+		};
+
+		const saveBtn = buttonContainer.createEl('button', { text: '保存阶段', cls: 'mod-cta' });
+		saveBtn.onclick = () => {
+			const name = nameInput.value.trim();
+			const pattern = patternInput.value.trim();
+			const replacement = replacementInput.value;
+			const flags = flagsInput.value.trim();
+
+			if (!name) {
+				new Notice('请输入阶段名称');
+				return;
+			}
+
+			if (!pattern) {
+				new Notice('请输入正则表达式模式');
+				return;
+			}
+
+			try {
+				new RegExp(pattern, flags);
+			} catch (e) {
+				new Notice('正则表达式无效: ' + e.message);
+				return;
+			}
+
+			const stageData: PipelineStage = {
+				id: this.stage?.id || Date.now().toString(),
+				name,
+				description: descInput.value.trim(),
+				pattern,
+				replacement,
+				flags: flags || 'g',
+				enabled: this.stage?.enabled ?? true
+			};
+
+			this.callback(stageData);
+			this.close();
+		};
+	}
+
+	onClose() {
+		const { contentEl } = this;
+		contentEl.empty();
+	}
+}
+
+// Pipeline 执行 Modal
+class RegexPipelineExecutionModal extends Modal {
+	plugin: RegexSearchPlugin;
+	pipeline: RegexPipeline;
+
+	constructor(app: App, plugin: RegexSearchPlugin, pipeline: RegexPipeline) {
+		super(app);
+		this.plugin = plugin;
+		this.pipeline = pipeline;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.addClass('regex-pipeline-execution-modal');
+
+		contentEl.createEl('h2', { text: `执行 Pipeline: ${this.pipeline.name}` });
+		contentEl.createEl('p', { text: this.pipeline.description });
+
+		contentEl.createEl('h3', { text: '选择执行范围' });
+
+		const scopeContainer = contentEl.createDiv('regex-execution-scope');
+
+		const allFilesBtn = scopeContainer.createEl('button', { text: '📚 整个 Vault', cls: 'mod-cta' });
+		allFilesBtn.onclick = () => this.executeOnVault();
+
+		const currentFileBtn = scopeContainer.createEl('button', { text: '📄 当前文件' });
+		currentFileBtn.onclick = () => this.executeOnCurrentFile();
+
+		const previewBtn = scopeContainer.createEl('button', { text: '👁️ 测试预览' });
+		previewBtn.onclick = () => this.showPreview();
+
+		// 添加关闭按钮
+		const closeButtonContainer = contentEl.createDiv('regex-execution-close-container');
+		closeButtonContainer.style.marginTop = '20px';
+		closeButtonContainer.style.textAlign = 'right';
+
+		const closeBtn = closeButtonContainer.createEl('button', { text: '取消' });
+		closeBtn.onclick = () => this.close();
+	}
+
+	async executeOnVault() {
+		new ConfirmModal(this.app, {
+			title: '确认执行',
+			message: `确定要在整个 Vault 中执行 Pipeline "${this.pipeline.name}" 吗？\n\n此操作将修改文件，建议先备份或使用 Git。`,
+			confirmText: '执行',
+			cancelText: '取消'
+		}, async (confirmed) => {
+			if (confirmed) {
+				this.plugin.incrementPipelineUsage(this.pipeline.id);
+
+				const progressEl = this.contentEl.createDiv('regex-progress');
+				progressEl.createEl('p', { text: '正在执行 Pipeline...' });
+
+				const result = await this.plugin.executePipelineInVault(
+					this.pipeline,
+					true,
+					null,
+					(progress) => {
+						progressEl.empty();
+						progressEl.createEl('p', { text: `处理中: ${progress.current}/${progress.total}` });
+						if (progress.currentFile) {
+							progressEl.createEl('small', { text: progress.currentFile });
+						}
+					}
+				);
+
+				progressEl.empty();
+				progressEl.createEl('h3', { text: '执行完成' });
+				progressEl.createEl('p', { text: `修改了 ${result.filesModified} 个文件` });
+				progressEl.createEl('p', { text: `总替换次数: ${result.totalReplacements}` });
+				progressEl.createEl('p', { text: `耗时: ${result.processingTime}ms` });
+
+				if (result.errors.length > 0) {
+					progressEl.createEl('h4', { text: '错误:' });
+					const errorList = progressEl.createEl('ul');
+					result.errors.forEach(error => {
+						errorList.createEl('li', { text: error });
+					});
+				}
+
+				new Notice(`Pipeline 执行完成，修改了 ${result.filesModified} 个文件`);
+
+				const closeBtn = progressEl.createEl('button', { text: '关闭', cls: 'mod-cta' });
+				closeBtn.onclick = () => this.close();
+			}
+		}).open();
+	}
+
+	async executeOnCurrentFile() {
+		const activeFile = this.app.workspace.getActiveFile();
+		if (!activeFile) {
+			new Notice('没有打开的文件');
+			return;
+		}
+
+		this.plugin.incrementPipelineUsage(this.pipeline.id);
+
+		const result = await this.plugin.executePipelineInVault(
+			this.pipeline,
+			false,
+			activeFile
+		);
+
+		if (result.filesModified > 0) {
+			new Notice(`Pipeline 执行完成，替换了 ${result.totalReplacements} 处`);
+		} else {
+			new Notice('未找到匹配项');
+		}
+
+		this.close();
+	}
+
+	showPreview() {
+		new RegexPipelinePreviewModal(this.app, this.plugin, this.pipeline).open();
+	}
+
+	onClose() {
+		const { contentEl } = this;
+		contentEl.empty();
+	}
+}
+
+// Pipeline 预览 Modal
+class RegexPipelinePreviewModal extends Modal {
+	plugin: RegexSearchPlugin;
+	pipeline: RegexPipeline;
+
+	constructor(app: App, plugin: RegexSearchPlugin, pipeline: RegexPipeline) {
+		super(app);
+		this.plugin = plugin;
+		this.pipeline = pipeline;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.addClass('regex-pipeline-preview-modal');
+
+		contentEl.createEl('h2', { text: `Pipeline 预览: ${this.pipeline.name}` });
+
+		contentEl.createEl('label', { text: '输入测试文本：' });
+		const testInput = contentEl.createEl('textarea', {
+			placeholder: '在此输入测试文本，查看 Pipeline 的执行结果...'
+		});
+		testInput.addClass('regex-test-input');
+		testInput.rows = 8;
+
+		// 添加按钮容器
+		const buttonContainer = contentEl.createDiv('regex-preview-buttons');
+		buttonContainer.style.marginTop = '20px';
+		buttonContainer.style.display = 'flex';
+		buttonContainer.style.justifyContent = 'flex-end';
+		buttonContainer.style.gap = '10px';
+
+		const previewBtn = buttonContainer.createEl('button', { text: '▶️ 预览结果', cls: 'mod-cta' });
+
+		const closeBtn = buttonContainer.createEl('button', { text: '关闭' });
+		closeBtn.onclick = () => {
+			this.close();
+		};
+
+		const resultContainer = contentEl.createDiv('regex-preview-results');
+
+		previewBtn.onclick = async () => {
+			const testText = testInput.value;
+			if (!testText) {
+				new Notice('请输入测试文本');
+				return;
+			}
+
+			resultContainer.empty();
+
+			let currentText = testText;
+			resultContainer.createEl('h4', { text: '原始文本:' });
+			resultContainer.createEl('pre', { text: testText });
+
+			this.pipeline.stages.forEach((stage, index) => {
+				if (!stage.enabled) return;
+
+				try {
+					const regex = new RegExp(stage.pattern, stage.flags);
+					const previousText = currentText;
+					currentText = currentText.replace(regex, stage.replacement);
+
+					resultContainer.createEl('h4', { text: `阶段 ${index + 1}: ${stage.name}` });
+					resultContainer.createEl('p', { text: `模式: /${stage.pattern}/${stage.flags}` });
+					resultContainer.createEl('p', { text: `替换: ${stage.replacement}` });
+					resultContainer.createEl('pre', { text: currentText });
+
+					if (previousText === currentText) {
+						resultContainer.createEl('p', { text: '(无变化)', cls: 'regex-no-change' });
+					}
+				} catch (error) {
+					resultContainer.createEl('p', { text: `错误: ${error.message}`, cls: 'regex-error' });
+				}
+			});
+
+			resultContainer.createEl('h4', { text: '最终结果:' });
+			resultContainer.createEl('pre', { text: currentText, cls: 'regex-final-result' });
+		};
+	}
+
+	onClose() {
+		const { contentEl } = this;
+		contentEl.empty();
+	}
+}
+
+// Pipeline 导入 Modal
+class RegexPipelineImportModal extends Modal {
+	plugin: RegexSearchPlugin;
+	callback: () => void;
+
+	constructor(app: App, plugin: RegexSearchPlugin, callback: () => void) {
+		super(app);
+		this.plugin = plugin;
+		this.callback = callback;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.addClass('regex-pipeline-import-modal');
+
+		contentEl.createEl('h2', { text: '导入 Pipeline' });
+
+		const textarea = contentEl.createEl('textarea', {
+			placeholder: '粘贴 Pipeline JSON 数据...'
+		});
+		textarea.addClass('regex-import-textarea');
+		textarea.rows = 10;
+
+		// 添加按钮容器
+		const buttonContainer = contentEl.createDiv('regex-import-buttons');
+		buttonContainer.style.marginTop = '20px';
+		buttonContainer.style.display = 'flex';
+		buttonContainer.style.justifyContent = 'flex-end';
+		buttonContainer.style.gap = '10px';
+
+		const cancelBtn = buttonContainer.createEl('button', { text: '取消' });
+		cancelBtn.onclick = () => {
+			this.close();
+		};
+
+		const importBtn = buttonContainer.createEl('button', { text: '导入', cls: 'mod-cta' });
+		importBtn.onclick = () => {
+			try {
+				const json = textarea.value.trim();
+				if (!json) {
+					new Notice('请输入 JSON 数据');
+					return;
+				}
+
+				const imported = this.plugin.importPipelines(json);
+
+				new Notice(`成功导入 ${imported} 个 Pipeline`);
+				this.callback();
+				this.close();
+			} catch (error) {
+				new Notice('导入失败: ' + error.message);
+			}
+		};
+	}
+
+	onClose() {
+		const { contentEl } = this;
+		contentEl.empty();
 	}
 }
