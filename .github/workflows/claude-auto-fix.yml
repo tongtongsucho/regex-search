@@ -1,0 +1,29 @@
+name: Claude Automated Issue Fix # 新工作流的名称
+
+on:
+  issues:
+    types: [opened] # 核心触发条件：当一个新的 Issue 被打开时
+
+jobs:
+  auto_fix_issue:
+    runs-on: ubuntu-latest
+    
+    # 关键权限设置：
+    permissions:
+      contents: write       # 允许提交代码到新分支
+      pull-requests: write  # 允许创建 Pull Request（这是新增的关键行）
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Auto Fix
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          
+          # 告诉 Claude 默认执行修复任务，它会自动读取 Issue 的标题和内容来理解 Bug
+          prompt: "/fix-issue"
