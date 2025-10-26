@@ -84,6 +84,20 @@ class RegexUtils {
 	static escapeRegex(text: string): string {
 		return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 	}
+
+	// 处理替换字符串中的转义序列
+	static processEscapeSequences(text: string): string {
+		return text.replace(/\\(.)/g, (match, char) => {
+			switch (char) {
+				case 'n': return '\n';
+				case 't': return '\t';
+				case 'r': return '\r';
+				case '\\': return '\\';
+				case '0': return '\0';
+				default: return match; // 保持原样，例如 $1, $2 等捕获组引用
+			}
+		});
+	}
 }
 
 // 搜索历史管理
@@ -1936,9 +1950,9 @@ class RegexSearchModal extends Modal {
 		// 替换函数
 		const performReplace = async () => {
 			if (!this.isIdle()) return;
-			
+
 			const pattern = RegexUtils.sanitizeInput(this.patternInput.value);
-			const replacement = this.replaceInput.value;
+			const replacement = RegexUtils.processEscapeSequences(this.replaceInput.value);
 			
 			if (!pattern) {
 				new Notice('请输入正则表达式');
