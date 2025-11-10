@@ -1,4 +1,4 @@
-import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, MarkdownView, debounce, Menu } from 'obsidian';
+import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, MarkdownView, debounce, Menu, Editor } from 'obsidian';
 
 // 常量定义
 const PLUGIN_CONFIG = {
@@ -72,7 +72,7 @@ class RegexUtils {
 		complexity += (pattern.match(/\[/g) || []).length * 3;
 		
 		// 预查复杂度
-		complexity += (pattern.match(/\?\=/g) || []).length * 20;
+		complexity += (pattern.match(/\?=/g) || []).length * 20;
 		
 		return complexity;
 	}
@@ -557,7 +557,7 @@ export default class RegexSearchPlugin extends Plugin {
 
 		// 添加当前文件搜索命令
 		this.addCommand({
-			id: 'regex-search-current-file',
+			id: 'current-file',
 			name: '在当前文件中搜索',
 			callback: () => {
 				const activeFile = this.app.workspace.getActiveFile();
@@ -609,7 +609,7 @@ export default class RegexSearchPlugin extends Plugin {
 		// 保存搜索历史
 		if (this.settings.enableSearchHistory) {
 			this.settings.searchHistory = this.searchHistory.get();
-			this.saveSettings();
+			void this.saveSettings();
 		}
 	}
 
@@ -630,8 +630,8 @@ export default class RegexSearchPlugin extends Plugin {
 		if (newBuiltInItems.length > 0 || this.settings.regexLibrary.length === 0) {
 			// 添加新的内置项目或初始化库
 			this.settings.regexLibrary.push(...newBuiltInItems);
-			this.saveSettings();
-			
+			void this.saveSettings();
+
 			if (newBuiltInItems.length > 0) {
 				new Notice(`已添加 ${newBuiltInItems.length} 个新的内置正则表达式`);
 			}
@@ -652,8 +652,8 @@ export default class RegexSearchPlugin extends Plugin {
 				
 				// 重新添加最新的内置项目
 				this.settings.regexLibrary.push(...BUILT_IN_REGEX_LIBRARY);
-				this.saveSettings();
-				
+				void this.saveSettings();
+
 				new Notice('内置正则表达式库已重置！');
 			}
 		}).open();
@@ -665,7 +665,7 @@ export default class RegexSearchPlugin extends Plugin {
 			RegexUtils.validateRegex(pattern, flags);
 			
 			const newItem: RegexLibraryItem = {
-				id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+				id: Date.now().toString() + Math.random().toString(36).substring(2, 11),
 				name: name.trim(),
 				pattern: pattern.trim(),
 				description: description.trim(),
@@ -677,7 +677,7 @@ export default class RegexSearchPlugin extends Plugin {
 			};
 			
 			this.settings.regexLibrary.push(newItem);
-			this.saveSettings();
+			void this.saveSettings();
 			return true;
 		} catch (error) {
 			new Notice('正则表达式无效：' + error.message);
@@ -706,8 +706,8 @@ export default class RegexSearchPlugin extends Plugin {
 			...updates,
 			updatedAt: Date.now()
 		};
-		
-		this.saveSettings();
+
+		void this.saveSettings();
 		return true;
 	}
 
@@ -716,7 +716,7 @@ export default class RegexSearchPlugin extends Plugin {
 		if (index === -1) return false;
 
 		this.settings.regexLibrary.splice(index, 1);
-		this.saveSettings();
+		void this.saveSettings();
 		return true;
 	}
 
@@ -729,7 +729,7 @@ export default class RegexSearchPlugin extends Plugin {
 		if (item) {
 			item.usage++;
 			item.updatedAt = Date.now();
-			this.saveSettings();
+			void this.saveSettings();
 		}
 	}
 
@@ -777,8 +777,8 @@ export default class RegexSearchPlugin extends Plugin {
 			const newItems = imported.filter(item => !existingIds.has(item.id));
 			
 			this.settings.regexLibrary.push(...newItems);
-			this.saveSettings();
-			
+			void this.saveSettings();
+
 			new Notice(`成功导入 ${newItems.length} 个正则表达式`);
 			return true;
 		} catch (error) {
@@ -801,7 +801,7 @@ export default class RegexSearchPlugin extends Plugin {
 				} catch {
 					return null;
 				}
-			}).filter(regex => regex !== null) as RegExp[];
+			}).filter((regex): regex is RegExp => regex !== null);
 		}
 		
 		return files.filter(file => {
@@ -1435,7 +1435,7 @@ export default class RegexSearchPlugin extends Plugin {
 	clearSearchHistory() {
 		this.searchHistory.clear();
 		this.settings.searchHistory = [];
-		this.saveSettings();
+		void this.saveSettings();
 	}
 }
 
@@ -1531,9 +1531,9 @@ class QuickSearchModal extends Modal {
 				const matchEl = fileEl.createDiv('quick-search-match');
 				matchEl.createEl('span', { text: `第${match.line}行: `, cls: 'quick-search-line' });
 				matchEl.createEl('span', { text: match.lineText, cls: 'quick-search-text' });
-				
+
 				matchEl.addEventListener('click', () => {
-					this.jumpToMatch(match);
+					void this.jumpToMatch(match);
 				});
 			});
 		});
@@ -1642,7 +1642,7 @@ class RegexSearchModal extends Modal {
 	// 状态调试和监控方法
 	private logStateTransition(from: SearchState, to: SearchState, action?: string) {
 		if (this.plugin.settings.enableDebugLogging) {
-			console.log(`🔄 状态转换: ${from} -> ${to}${action ? ` (${action})` : ''}`);
+			console.debug(`🔄 状态转换: ${from} -> ${to}${action ? ` (${action})` : ''}`);
 		}
 	}
 
@@ -1707,7 +1707,7 @@ class RegexSearchModal extends Modal {
 				RegexUtils.validateRegex(pattern, flags);
 				this.patternInput.removeClass('regex-pattern-error');
 				this.patternInput.addClass('regex-pattern-valid');
-			} catch (error) {
+			} catch {
 				this.patternInput.removeClass('regex-pattern-valid');
 				this.patternInput.addClass('regex-pattern-error');
 			}
@@ -1722,7 +1722,7 @@ class RegexSearchModal extends Modal {
 		this.modalEl.addClass('regex-search-modal');
 		
 		// 创建标题
-		const titleEl = contentEl.createEl('h2', { 
+		contentEl.createEl('h2', {
 			text: this.currentFile ? `🔍 在 ${this.currentFile.name} 中搜索` : '🎯 正则表达式搜索',
 			cls: 'regex-search-title'
 		});
@@ -2173,7 +2173,7 @@ class RegexSearchModal extends Modal {
 
 			// 点击跳转
 			matchEl.addEventListener('click', () => {
-				this.jumpToMatch(match);
+				void this.jumpToMatch(match);
 			});
 		});
 	}
@@ -2229,7 +2229,7 @@ class RegexSearchModal extends Modal {
 		}
 	}
 
-	private highlightMatch(editor: any, match: SearchMatch) {
+	private highlightMatch(editor: Editor, match: SearchMatch) {
 		try {
 			const line = match.line - 1;
 			const column = match.column - 1;
@@ -2254,12 +2254,12 @@ class RegexSearchModal extends Modal {
 			setTimeout(() => {
 				try {
 					editor.setCursor(line, column);
-				} catch (error) {
+				} catch {
 					// 忽略错误，可能是编辑器已关闭
 				}
 			}, PLUGIN_CONFIG.HIGHLIGHT_DURATION);
-		} catch (error) {
-			console.error('高亮匹配文本时出错:', error);
+		} catch {
+			// 忽略错误，可能是编辑器已关闭
 		}
 	}
 
@@ -2434,9 +2434,9 @@ class RegexLibraryModal extends Modal {
 
 	private exportLibrary() {
 		const json = this.plugin.exportRegexLibrary();
-		navigator.clipboard.writeText(json).then(() => {
+		void navigator.clipboard.writeText(json).then(() => {
 			new Notice('正则表达式库已复制到剪贴板');
-		})
+		});
 	}
 
 	onClose() {
@@ -2527,7 +2527,7 @@ class RegexLibraryItemModal extends Modal {
 
 		// 按钮
 		const buttonContainer = form.createDiv('form-buttons');
-		const saveButton = buttonContainer.createEl('button', { text: '保存', type: 'submit', cls: 'regex-form-save-btn' });
+		buttonContainer.createEl('button', { text: '保存', type: 'submit', cls: 'regex-form-save-btn' });
 		const cancelButton = buttonContainer.createEl('button', { text: '取消', type: 'button', cls: 'regex-form-cancel-btn' });
 
 		// 事件处理
@@ -2614,7 +2614,7 @@ class RegexLibraryImportModal extends Modal {
 		}) as HTMLTextAreaElement;
 
 		const buttonContainer = form.createDiv('form-buttons');
-		const importButton = buttonContainer.createEl('button', { text: '导入', type: 'submit', cls: 'regex-form-save-btn' });
+		buttonContainer.createEl('button', { text: '导入', type: 'submit', cls: 'regex-form-save-btn' });
 		const cancelButton = buttonContainer.createEl('button', { text: '取消', type: 'button', cls: 'regex-form-cancel-btn' });
 
 		form.addEventListener('submit', (e) => {
@@ -2765,7 +2765,7 @@ class RegexSearchSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}));
 
-		const multilineSetting = new Setting(containerEl)
+		new Setting(containerEl)
 			.setName('多行模式')
 			.setDesc('默认启用多行模式（^ 和 $ 匹配行首行尾）')
 			.addToggle(toggle => toggle
