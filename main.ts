@@ -78,7 +78,11 @@ class RegexUtils {
 	}
 	
 	static sanitizeInput(input: string): string {
-		return input.trim().replace(/[\x00-\x1F\x7F]/g, '');
+		// Remove control characters (0x00-0x1F and 0x7F)
+		return input.trim().split('').filter(char => {
+			const code = char.charCodeAt(0);
+			return code > 0x1F && code !== 0x7F;
+		}).join('');
 	}
 	
 	static escapeRegex(text: string): string {
@@ -548,7 +552,7 @@ export default class RegexSearchPlugin extends Plugin {
 
 		// 添加搜索命令
 		this.addCommand({
-			id: 'open-regex-search',
+			id: 'open-search',
 			name: '打开正则表达式搜索',
 			callback: () => {
 				new RegexSearchModal(this.app, this).open();
@@ -571,7 +575,7 @@ export default class RegexSearchPlugin extends Plugin {
 
 		// 添加快速搜索命令
 		this.addCommand({
-			id: 'quick-regex-search',
+			id: 'quick-search',
 			name: '快速正则表达式搜索',
 			callback: () => {
 				new QuickSearchModal(this.app, this).open();
@@ -580,7 +584,7 @@ export default class RegexSearchPlugin extends Plugin {
 
 		// 添加正则表达式库管理命令
 		this.addCommand({
-			id: 'manage-regex-library',
+			id: 'manage-library',
 			name: '管理正则表达式库',
 			callback: () => {
 				new RegexLibraryModal(this.app, this).open();
@@ -589,7 +593,7 @@ export default class RegexSearchPlugin extends Plugin {
 
 		// 添加重置内置库命令
 		this.addCommand({
-			id: 'reset-builtin-regex-library',
+			id: 'reset-builtin-library',
 			name: '重置内置正则表达式库',
 			callback: () => {
 				this.resetBuiltInRegexLibrary();
@@ -757,8 +761,8 @@ export default class RegexSearchPlugin extends Plugin {
 
 	importRegexLibrary(jsonString: string): boolean {
 		try {
-			const imported = JSON.parse(jsonString) as RegexLibraryItem[];
-			
+			const imported = JSON.parse(jsonString);
+
 			// 验证导入的数据
 			if (!Array.isArray(imported)) {
 				throw new Error('导入的数据格式不正确');
@@ -2777,10 +2781,10 @@ class RegexSearchSettingTab extends PluginSettingTab {
 
 		// 添加多行模式详细说明
 		const multilineHelp = containerEl.createEl('div', { cls: 'setting-item-description regex-multiline-help' });
-		
+
 		// 使用 DOM API 创建帮助内容
-		const helpTitle = multilineHelp.createEl('span', { cls: 'help-title', text: '💡 多行模式说明：' });
-		
+		multilineHelp.createEl('span', { cls: 'help-title', text: '💡 多行模式说明：' });
+
 		const singleLineItem = multilineHelp.createEl('div', { cls: 'help-item' });
 		singleLineItem.createEl('span', { text: '• ' });
 		singleLineItem.createEl('strong', { text: '单行模式' });
@@ -2921,7 +2925,7 @@ class RegexSearchSettingTab extends PluginSettingTab {
 			.addButton(button => button
 				.setButtonText('🗑️ 清空历史')
 				.setWarning()
-				.onClick(async () => {
+				.onClick(() => {
 					this.plugin.clearSearchHistory();
 					new Notice('搜索历史已清空');
 				}));
