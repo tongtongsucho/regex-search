@@ -613,7 +613,7 @@ export default class RegexSearchPlugin extends Plugin {
 		// 保存搜索历史
 		if (this.settings.enableSearchHistory) {
 			this.settings.searchHistory = this.searchHistory.get();
-			void this.saveSettings();
+			this.saveSettings().catch(err => console.error('Failed to save settings:', err));
 		}
 	}
 
@@ -634,7 +634,7 @@ export default class RegexSearchPlugin extends Plugin {
 		if (newBuiltInItems.length > 0 || this.settings.regexLibrary.length === 0) {
 			// 添加新的内置项目或初始化库
 			this.settings.regexLibrary.push(...newBuiltInItems);
-			void this.saveSettings();
+			this.saveSettings().catch(err => console.error('Failed to save settings:', err));
 
 			if (newBuiltInItems.length > 0) {
 				new Notice(`已添加 ${newBuiltInItems.length} 个新的内置正则表达式`);
@@ -656,7 +656,7 @@ export default class RegexSearchPlugin extends Plugin {
 				
 				// 重新添加最新的内置项目
 				this.settings.regexLibrary.push(...BUILT_IN_REGEX_LIBRARY);
-				void this.saveSettings();
+				this.saveSettings().catch(err => console.error('Failed to save settings:', err));
 
 				new Notice('内置正则表达式库已重置！');
 			}
@@ -681,7 +681,7 @@ export default class RegexSearchPlugin extends Plugin {
 			};
 			
 			this.settings.regexLibrary.push(newItem);
-			void this.saveSettings();
+			this.saveSettings().catch(err => console.error('Failed to save settings:', err));
 			return true;
 		} catch (error) {
 			new Notice('正则表达式无效：' + error.message);
@@ -711,7 +711,7 @@ export default class RegexSearchPlugin extends Plugin {
 			updatedAt: Date.now()
 		};
 
-		void this.saveSettings();
+		this.saveSettings().catch(err => console.error('Failed to save settings:', err));
 		return true;
 	}
 
@@ -720,7 +720,7 @@ export default class RegexSearchPlugin extends Plugin {
 		if (index === -1) return false;
 
 		this.settings.regexLibrary.splice(index, 1);
-		void this.saveSettings();
+		this.saveSettings().catch(err => console.error('Failed to save settings:', err));
 		return true;
 	}
 
@@ -733,7 +733,7 @@ export default class RegexSearchPlugin extends Plugin {
 		if (item) {
 			item.usage++;
 			item.updatedAt = Date.now();
-			void this.saveSettings();
+			this.saveSettings().catch(err => console.error('Failed to save settings:', err));
 		}
 	}
 
@@ -781,7 +781,7 @@ export default class RegexSearchPlugin extends Plugin {
 			const newItems = imported.filter(item => !existingIds.has(item.id));
 			
 			this.settings.regexLibrary.push(...newItems);
-			void this.saveSettings();
+			this.saveSettings().catch(err => console.error('Failed to save settings:', err));
 
 			new Notice(`成功导入 ${newItems.length} 个正则表达式`);
 			return true;
@@ -1439,7 +1439,7 @@ export default class RegexSearchPlugin extends Plugin {
 	clearSearchHistory() {
 		this.searchHistory.clear();
 		this.settings.searchHistory = [];
-		void this.saveSettings();
+		this.saveSettings().catch(err => console.error('Failed to save settings:', err));
 	}
 }
 
@@ -1536,9 +1536,13 @@ class QuickSearchModal extends Modal {
 				matchEl.createEl('span', { text: `第${match.line}行: `, cls: 'quick-search-line' });
 				matchEl.createEl('span', { text: match.lineText, cls: 'quick-search-text' });
 
-				matchEl.addEventListener('click', () => {
-					void this.jumpToMatch(match);
-				});
+			matchEl.addEventListener('click', async () => {
+				try {
+					await this.jumpToMatch(match);
+				} catch (error) {
+					console.error('Failed to jump to match:', error);
+				}
+			});
 			});
 		});
 	}
@@ -1698,8 +1702,8 @@ class RegexSearchModal extends Modal {
 			try {
 				// 构建当前标志
 				let flags = 'g';
-				const caseSensitiveToggle = this.containerEl.querySelector('.regex-options-container input:nth-of-type(1)') as HTMLInputElement;
-				const multilineToggle = this.containerEl.querySelector('.regex-options-container input:nth-of-type(2)') as HTMLInputElement;
+			const caseSensitiveToggle = this.containerEl.querySelector('.regex-options-container input:nth-of-type(1)') as HTMLInputElement;
+			const multilineToggle = this.containerEl.querySelector('.regex-options-container input:nth-of-type(2)') as HTMLInputElement;
 				
 				if (caseSensitiveToggle && !caseSensitiveToggle.checked) {
 					flags += 'i';
@@ -2176,8 +2180,12 @@ class RegexSearchModal extends Modal {
 			this.renderMatchContent(contentEl, match);
 
 			// 点击跳转
-			matchEl.addEventListener('click', () => {
-				void this.jumpToMatch(match);
+			matchEl.addEventListener('click', async () => {
+				try {
+					await this.jumpToMatch(match);
+				} catch (error) {
+					console.error('Failed to jump to match:', error);
+				}
 			});
 		});
 	}
@@ -2438,8 +2446,11 @@ class RegexLibraryModal extends Modal {
 
 	private exportLibrary() {
 		const json = this.plugin.exportRegexLibrary();
-		void navigator.clipboard.writeText(json).then(() => {
+		navigator.clipboard.writeText(json).then(() => {
 			new Notice('正则表达式库已复制到剪贴板');
+		}).catch(err => {
+			console.error('Failed to copy to clipboard:', err);
+			new Notice('复制到剪贴板失败');
 		});
 	}
 
@@ -2488,7 +2499,7 @@ class RegexLibraryItemModal extends Modal {
 			value: this.item?.name || '',
 			placeholder: '输入表达式名称...',
 			cls: 'regex-form-input'
-		}) as HTMLInputElement;
+		});
 
 		// 正则表达式
 		const patternContainer = form.createDiv('form-group');
@@ -2498,7 +2509,7 @@ class RegexLibraryItemModal extends Modal {
 			value: this.item?.pattern || '',
 			placeholder: '输入正则表达式...',
 			cls: 'regex-form-input regex-pattern-input'
-		}) as HTMLInputElement;
+		});
 
 		// 标志
 		const flagsContainer = form.createDiv('form-group');
@@ -2508,7 +2519,7 @@ class RegexLibraryItemModal extends Modal {
 			value: this.item?.flags || 'g',
 			placeholder: 'g, i, m, s...',
 			cls: 'regex-form-input'
-		}) as HTMLInputElement;
+		});
 
 		// 描述
 		const descContainer = form.createDiv('form-group');
@@ -2517,7 +2528,7 @@ class RegexLibraryItemModal extends Modal {
 			value: this.item?.description || '',
 			placeholder: '描述这个正则表达式的用途...',
 			cls: 'regex-form-textarea'
-		}) as HTMLTextAreaElement;
+		});
 
 		// 分类
 		const categoryContainer = form.createDiv('form-group');
@@ -2527,7 +2538,7 @@ class RegexLibraryItemModal extends Modal {
 			value: this.item?.category || '自定义',
 			placeholder: '输入分类名称...',
 			cls: 'regex-form-input'
-		}) as HTMLInputElement;
+		});
 
 		// 按钮
 		const buttonContainer = form.createDiv('form-buttons');
@@ -2615,7 +2626,7 @@ class RegexLibraryImportModal extends Modal {
 		const textarea = textareaContainer.createEl('textarea', {
 			placeholder: '在这里粘贴正则表达式库的JSON数据...',
 			cls: 'regex-import-textarea'
-		}) as HTMLTextAreaElement;
+		});
 
 		const buttonContainer = form.createDiv('form-buttons');
 		buttonContainer.createEl('button', { text: '导入', type: 'submit', cls: 'regex-form-save-btn' });
