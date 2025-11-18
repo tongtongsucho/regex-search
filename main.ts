@@ -2192,7 +2192,7 @@ class RegexSearchModal extends Modal {
 
 	private renderMatchContent(contentEl: HTMLElement, match: SearchMatch) {
 		const contextLines = match.context.split('\n');
-		contextLines.forEach((line, lineIndex) => {
+		contextLines.forEach((line) => {
 			const lineEl = contentEl.createEl('div', { cls: 'regex-context-line' });
 			
 			// 检查是否是匹配行
