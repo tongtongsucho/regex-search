@@ -1,535 +1,27 @@
-import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, MarkdownView, debounce, Menu, Editor } from 'obsidian';
-
-// 常量定义
-const PLUGIN_CONFIG = {
-	MAX_REGEX_COMPLEXITY: 1000,
-	MAX_FILE_SIZE: 10 * 1024 * 1024, // 10MB
-	BATCH_SIZE: 8, // 增加批处理大小
-	SEARCH_BATCH_SIZE: 20, // 增加搜索批处理大小
-	DEBOUNCE_DELAY: 150, // 减少防抖延迟
-	PROGRESS_UPDATE_INTERVAL: 50, // 更频繁的进度更新
-	HIGHLIGHT_DURATION: 3000,
-	MAX_CONTEXT_LINES: 2, // 减少上下文行数
-	MAX_RESULTS_PER_FILE: 50, // 减少每个文件的最大结果数
-	MIN_SEARCH_LENGTH: 1,
-	MAX_SEARCH_LENGTH: 500,
-	TIMEOUT_DURATION: 15000, // 减少超时时间到15秒
-	MAX_SEARCH_RESULTS: 3000 // 设置合理的总搜索结果数限制
-};
-
-// 错误类型定义
-class RegexValidationError extends Error {
-	constructor(message: string, public readonly pattern: string) {
-		super(message);
-		this.name = 'RegexValidationError';
-	}
-}
-
-class SearchTimeoutError extends Error {
-	constructor(message: string) {
-		super(message);
-		this.name = 'SearchTimeoutError';
-	}
-}
-
-// 实用工具类
-class RegexUtils {
-	static validateRegex(pattern: string, flags: string): RegExp {
-		if (!pattern || pattern.length === 0) {
-			throw new RegexValidationError('正则表达式不能为空', pattern);
-		}
-		
-		if (pattern.length > PLUGIN_CONFIG.MAX_SEARCH_LENGTH) {
-			throw new RegexValidationError(`正则表达式过长（最大${PLUGIN_CONFIG.MAX_SEARCH_LENGTH}字符）`, pattern);
-		}
-		
-		// 检查潜在的复杂性
-		const complexityScore = this.calculateComplexity(pattern);
-		if (complexityScore > PLUGIN_CONFIG.MAX_REGEX_COMPLEXITY) {
-			throw new RegexValidationError('正则表达式过于复杂，可能导致性能问题', pattern);
-		}
-		
-		try {
-			return new RegExp(pattern, flags);
-		} catch (error) {
-			throw new RegexValidationError(`正则表达式语法错误: ${error.message}`, pattern);
-		}
-	}
-	
-	static calculateComplexity(pattern: string): number {
-		let complexity = 0;
-		
-		// 基础复杂度
-		complexity += pattern.length;
-		
-		// 量词复杂度
-		complexity += (pattern.match(/[*+?{]/g) || []).length * 10;
-		
-		// 回溯组复杂度
-		complexity += (pattern.match(/\(/g) || []).length * 5;
-		
-		// 字符类复杂度
-		complexity += (pattern.match(/\[/g) || []).length * 3;
-		
-		// 预查复杂度
-		complexity += (pattern.match(/\?=/g) || []).length * 20;
-		
-		return complexity;
-	}
-	
-	static sanitizeInput(input: string): string {
-		// Remove control characters (0x00-0x1F and 0x7F)
-		return input.trim().split('').filter(char => {
-			const code = char.charCodeAt(0);
-			return code > 0x1F && code !== 0x7F;
-		}).join('');
-	}
-	
-	static escapeRegex(text: string): string {
-		return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-	}
-
-	// 处理替换字符串中的转义序列
-	static processEscapeSequences(text: string): string {
-		return text.replace(/\\(.)/g, (match, char) => {
-			switch (char) {
-				case 'n': return '\n';
-				case 't': return '\t';
-				case 'r': return '\r';
-				case '\\': return '\\';
-				case '0': return '\0';
-				default: return match; // 保持原样，例如 $1, $2 等捕获组引用
-			}
-		});
-	}
-}
-
-// 搜索历史管理
-class SearchHistory {
-	private history: string[] = [];
-	private maxSize: number = 20;
-	
-	add(pattern: string) {
-		if (!pattern || pattern.length === 0) return;
-		
-		// 移除重复项
-		const index = this.history.indexOf(pattern);
-		if (index > -1) {
-			this.history.splice(index, 1);
-		}
-		
-		// 添加到开头
-		this.history.unshift(pattern);
-		
-		// 保持最大长度
-		if (this.history.length > this.maxSize) {
-			this.history = this.history.slice(0, this.maxSize);
-		}
-	}
-	
-	get(): string[] {
-		return [...this.history];
-	}
-	
-	clear() {
-		this.history = [];
-	}
-}
-
-// 搜索任务管理
-class SearchTask {
-	private abortController: AbortController;
-	private timeoutId: number | undefined;
-	
-	constructor(private timeoutMs: number = PLUGIN_CONFIG.TIMEOUT_DURATION) {
-		this.abortController = new AbortController();
-	}
-	
-	get signal(): AbortSignal {
-		return this.abortController.signal;
-	}
-	
-	start(): Promise<void> {
-		return new Promise((resolve, reject) => {
-			this.timeoutId = window.setTimeout(() => {
-				this.cancel();
-				reject(new SearchTimeoutError('搜索超时'));
-			}, this.timeoutMs);
-			
-			this.abortController.signal.addEventListener('abort', () => {
-				if (this.timeoutId) {
-					clearTimeout(this.timeoutId);
-				}
-				reject(new Error('搜索已取消'));
-			});
-		});
-	}
-	
-	cancel() {
-		if (this.timeoutId) {
-			clearTimeout(this.timeoutId);
-		}
-		this.abortController.abort();
-	}
-	
-	complete() {
-		if (this.timeoutId) {
-			clearTimeout(this.timeoutId);
-		}
-	}
-}
-
-// 在现有接口定义之前添加状态管理相关的枚举和类型
-enum SearchState {
-	Idle = 'idle',          // 空闲状态 - 可以开始新搜索
-	Searching = 'searching', // 搜索中 - 正在执行搜索操作
-	Replacing = 'replacing', // 替换中 - 正在执行替换操作
-	Cancelled = 'cancelled', // 已取消 - 操作被用户取消
-	Error = 'error'         // 错误状态 - 操作出现异常
-}
-
-interface StateTransition {
-	from: SearchState[];
-	to: SearchState;
-	action?: string;
-}
-
-// 定义状态转换规则
-const STATE_TRANSITIONS: Record<string, StateTransition> = {
-	startSearch: { from: [SearchState.Idle], to: SearchState.Searching, action: 'search' },
-	startReplace: { from: [SearchState.Idle], to: SearchState.Replacing, action: 'replace' },
-	completeOperation: { from: [SearchState.Searching, SearchState.Replacing], to: SearchState.Idle },
-	cancelOperation: { from: [SearchState.Searching, SearchState.Replacing], to: SearchState.Cancelled },
-	handleError: { from: [SearchState.Searching, SearchState.Replacing], to: SearchState.Error },
-	reset: { from: [SearchState.Cancelled, SearchState.Error], to: SearchState.Idle }
-};
-
-// 正则表达式库项接口
-interface RegexLibraryItem {
-	id: string;
-	name: string;
-	pattern: string;
-	description: string;
-	category: string;
-	flags: string;
-	createdAt: number;
-	updatedAt: number;
-	usage: number; // 使用次数
-}
-
-// 接口定义
-interface RegexSearchSettings {
-	defaultPattern: string;
-	caseSensitive: boolean;
-	multiline: boolean;
-	maxResultsPerFile: number;
-	includeHiddenFiles: boolean;
-	fileExtensions: string[];
-	searchHistory: string[];
-	enableSearchHistory: boolean;
-	confirmReplace: boolean;
-	enableProgressIndicator: boolean;
-	excludePatterns: string[];
-	enableDebugLogging: boolean;
-	regexLibrary: RegexLibraryItem[];
-	enableRegexLibrary: boolean;
-}
-
-const DEFAULT_SETTINGS: RegexSearchSettings = {
-	defaultPattern: '',
-	caseSensitive: false,
-	multiline: false,
-	maxResultsPerFile: 50,
-	includeHiddenFiles: false,
-	fileExtensions: ['md'], // 只搜索 Markdown 文件，与官方搜索保持一致
-	searchHistory: [],
-	enableSearchHistory: true,
-	confirmReplace: true,
-	enableProgressIndicator: true,
-	excludePatterns: [],
-	enableDebugLogging: false,
-	regexLibrary: [],
-	enableRegexLibrary: true
-};
-
-// 预定义的常用正则表达式
-const BUILT_IN_REGEX_LIBRARY: RegexLibraryItem[] = [
-	// 联系信息
-	{
-		id: 'email',
-		name: '电子邮箱',
-		pattern: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}',
-		description: '匹配标准格式的电子邮箱地址',
-		category: '联系信息',
-		flags: 'gi',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	{
-		id: 'phone-cn',
-		name: '中国手机号',
-		pattern: '1[3-9]\\d{9}',
-		description: '匹配中国大陆11位手机号码',
-		category: '联系信息',
-		flags: 'g',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	{
-		id: 'phone-fixed-cn',
-		name: '中国固定电话',
-		pattern: '0\\d{2,3}-?\\d{7,8}',
-		description: '匹配中国固定电话号码',
-		category: '联系信息',
-		flags: 'g',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	
-	// 网络相关
-	{
-		id: 'url',
-		name: '网址链接',
-		pattern: 'https?://[^\\s\\]\\)]+',
-		description: '匹配HTTP或HTTPS网址',
-		category: '网络',
-		flags: 'gi',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	{
-		id: 'ip-address',
-		name: 'IP地址',
-		pattern: '(?:(?:25[0-5]|2[0-4]\\d|[01]?\\d\\d?)\\.){3}(?:25[0-5]|2[0-4]\\d|[01]?\\d\\d?)',
-		description: '匹配IPv4地址',
-		category: '网络',
-		flags: 'g',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	{
-		id: 'domain',
-		name: '域名',
-		pattern: '[a-zA-Z0-9]([a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9])?\\.[a-zA-Z]{2,}',
-		description: '匹配域名',
-		category: '网络',
-		flags: 'gi',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	
-	// 日期时间
-	{
-		id: 'date-iso',
-		name: 'ISO日期',
-		pattern: '\\d{4}-\\d{2}-\\d{2}',
-		description: '匹配YYYY-MM-DD格式的日期',
-		category: '日期时间',
-		flags: 'g',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	{
-		id: 'date-cn',
-		name: '中文日期',
-		pattern: '\\d{4}年\\d{1,2}月\\d{1,2}日',
-		description: '匹配中文格式日期',
-		category: '日期时间',
-		flags: 'g',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	{
-		id: 'time-24h',
-		name: '24小时时间',
-		pattern: '([01]?\\d|2[0-3]):[0-5]\\d(:[0-5]\\d)?',
-		description: '匹配24小时制时间格式',
-		category: '日期时间',
-		flags: 'g',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	
-	// 文件和路径
-	{
-		id: 'file-image',
-		name: '图片文件',
-		pattern: '[^\\s]+\\.(jpg|jpeg|png|gif|bmp|webp|svg)(?:\\?[^\\s]*)?',
-		description: '匹配常见图片文件扩展名',
-		category: '文件',
-		flags: 'gi',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	{
-		id: 'file-document',
-		name: '文档文件',
-		pattern: '[^\\s]+\\.(pdf|doc|docx|xls|xlsx|ppt|pptx|txt|rtf)(?:\\?[^\\s]*)?',
-		description: '匹配常见文档文件扩展名',
-		category: '文件',
-		flags: 'gi',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	{
-		id: 'file-media',
-		name: '媒体文件',
-		pattern: '[^\\s]+\\.(mp4|avi|mkv|mov|wmv|flv|mp3|wav|flac|aac|ogg)(?:\\?[^\\s]*)?',
-		description: '匹配常见音视频文件扩展名',
-		category: '文件',
-		flags: 'gi',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	{
-		id: 'file-archive',
-		name: '压缩文件',
-		pattern: '[^\\s]+\\.(zip|rar|7z|tar|gz|bz2|xz)(?:\\?[^\\s]*)?',
-		description: '匹配常见压缩文件扩展名',
-		category: '文件',
-		flags: 'gi',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	
-	// Markdown
-	{
-		id: 'markdown-link',
-		name: 'Markdown链接',
-		pattern: '\\[([^\\]]+)\\]\\(([^\\)]+)\\)',
-		description: '匹配Markdown格式的链接 [文本](链接)',
-		category: 'Markdown',
-		flags: 'g',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	{
-		id: 'markdown-image',
-		name: 'Markdown图片',
-		pattern: '!\\[([^\\]]*)\\]\\(([^\\)]+)\\)',
-		description: '匹配Markdown格式的图片 ![alt](url)',
-		category: 'Markdown',
-		flags: 'g',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	{
-		id: 'markdown-heading',
-		name: 'Markdown标题',
-		pattern: '^#{1,6}\\s+.+$',
-		description: '匹配Markdown标题（# ## ### 等）',
-		category: 'Markdown',
-		flags: 'gm',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	{
-		id: 'markdown-code-block',
-		name: 'Markdown代码块',
-		pattern: '```[\\s\\S]*?```',
-		description: '匹配Markdown代码块',
-		category: 'Markdown',
-		flags: 'g',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	
-
-
-	
-	// 数字和代码
-	{
-		id: 'number-decimal',
-		name: '小数',
-		pattern: '-?\\d+\\.\\d+',
-		description: '匹配小数（包括负数）',
-		category: '数字',
-		flags: 'g',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	{
-		id: 'number-integer',
-		name: '整数',
-		pattern: '-?\\d+',
-		description: '匹配整数（包括负数）',
-		category: '数字',
-		flags: 'g',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	},
-	{
-		id: 'hex-color',
-		name: '十六进制颜色',
-		pattern: '#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})',
-		description: '匹配十六进制颜色代码',
-		category: '代码',
-		flags: 'gi',
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		usage: 0
-	}
-];
-
-interface SearchMatch {
-	file: TFile;
-	line: number;
-	column: number;
-	match: string;
-	context: string;
-	lineText: string;
-	matchId: string;
-}
-
-interface SearchResult {
-	file: TFile;
-	matches: SearchMatch[];
-	totalMatches: number;
-	searchTime: number;
-	error?: string;
-}
-
-interface ReplaceResult {
-	file: TFile;
-	replacedCount: number;
-	originalContent: string;
-	newContent: string;
-	error?: string;
-}
-
-interface VaultReplaceResult {
-	totalReplacements: number;
-	filesModified: number;
-	results: ReplaceResult[];
-	errors: string[];
-	processingTime: number;
-}
-
-interface SearchProgress {
-	current: number;
-	total: number;
-	currentFile?: string;
-	isComplete: boolean;
-}
+import { App, Editor, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, MarkdownView, debounce, Menu } from 'obsidian';
+import { 
+	SearchState, 
+	RegexLibraryItem, 
+	RegexSearchSettings, 
+	SearchMatch, 
+	SearchResult, 
+	ReplaceResult, 
+	VaultReplaceResult, 
+	SearchProgress 
+} from './src/types';
+import { 
+	RegexUtils, 
+	SearchHistory, 
+	SearchTask, 
+	RegexValidationError, 
+	SearchTimeoutError 
+} from './src/utils';
+import { 
+	PLUGIN_CONFIG, 
+	DEFAULT_SETTINGS, 
+	STATE_TRANSITIONS, 
+	BUILT_IN_REGEX_LIBRARY 
+} from './src/constants';
 
 export default class RegexSearchPlugin extends Plugin {
 	settings: RegexSearchSettings;
@@ -561,7 +53,7 @@ export default class RegexSearchPlugin extends Plugin {
 
 		// 添加当前文件搜索命令
 		this.addCommand({
-			id: 'current-file',
+			id: 'search-current-file',
 			name: '在当前文件中搜索',
 			callback: () => {
 				const activeFile = this.app.workspace.getActiveFile();
@@ -613,7 +105,7 @@ export default class RegexSearchPlugin extends Plugin {
 		// 保存搜索历史
 		if (this.settings.enableSearchHistory) {
 			this.settings.searchHistory = this.searchHistory.get();
-			this.saveSettings().catch(err => console.error('Failed to save settings:', err));
+			void this.saveSettings();
 		}
 	}
 
@@ -634,8 +126,8 @@ export default class RegexSearchPlugin extends Plugin {
 		if (newBuiltInItems.length > 0 || this.settings.regexLibrary.length === 0) {
 			// 添加新的内置项目或初始化库
 			this.settings.regexLibrary.push(...newBuiltInItems);
-			this.saveSettings().catch(err => console.error('Failed to save settings:', err));
-
+			void this.saveSettings();
+			
 			if (newBuiltInItems.length > 0) {
 				new Notice(`已添加 ${newBuiltInItems.length} 个新的内置正则表达式`);
 			}
@@ -656,8 +148,8 @@ export default class RegexSearchPlugin extends Plugin {
 				
 				// 重新添加最新的内置项目
 				this.settings.regexLibrary.push(...BUILT_IN_REGEX_LIBRARY);
-				this.saveSettings().catch(err => console.error('Failed to save settings:', err));
-
+				void this.saveSettings();
+				
 				new Notice('内置正则表达式库已重置！');
 			}
 		}).open();
@@ -669,7 +161,7 @@ export default class RegexSearchPlugin extends Plugin {
 			RegexUtils.validateRegex(pattern, flags);
 			
 			const newItem: RegexLibraryItem = {
-				id: Date.now().toString() + Math.random().toString(36).substring(2, 11),
+			id: Date.now().toString() + Math.random().toString(36).slice(2, 11),
 				name: name.trim(),
 				pattern: pattern.trim(),
 				description: description.trim(),
@@ -681,7 +173,7 @@ export default class RegexSearchPlugin extends Plugin {
 			};
 			
 			this.settings.regexLibrary.push(newItem);
-			this.saveSettings().catch(err => console.error('Failed to save settings:', err));
+			void this.saveSettings();
 			return true;
 		} catch (error) {
 			new Notice('正则表达式无效：' + error.message);
@@ -710,8 +202,8 @@ export default class RegexSearchPlugin extends Plugin {
 			...updates,
 			updatedAt: Date.now()
 		};
-
-		this.saveSettings().catch(err => console.error('Failed to save settings:', err));
+		
+		void this.saveSettings();
 		return true;
 	}
 
@@ -720,7 +212,7 @@ export default class RegexSearchPlugin extends Plugin {
 		if (index === -1) return false;
 
 		this.settings.regexLibrary.splice(index, 1);
-		this.saveSettings().catch(err => console.error('Failed to save settings:', err));
+		void this.saveSettings();
 		return true;
 	}
 
@@ -733,7 +225,7 @@ export default class RegexSearchPlugin extends Plugin {
 		if (item) {
 			item.usage++;
 			item.updatedAt = Date.now();
-			this.saveSettings().catch(err => console.error('Failed to save settings:', err));
+			void this.saveSettings();
 		}
 	}
 
@@ -761,8 +253,8 @@ export default class RegexSearchPlugin extends Plugin {
 
 	importRegexLibrary(jsonString: string): boolean {
 		try {
-			const imported = JSON.parse(jsonString);
-
+			const imported = JSON.parse(jsonString) as RegexLibraryItem[];
+			
 			// 验证导入的数据
 			if (!Array.isArray(imported)) {
 				throw new Error('导入的数据格式不正确');
@@ -781,8 +273,8 @@ export default class RegexSearchPlugin extends Plugin {
 			const newItems = imported.filter(item => !existingIds.has(item.id));
 			
 			this.settings.regexLibrary.push(...newItems);
-			this.saveSettings().catch(err => console.error('Failed to save settings:', err));
-
+			void this.saveSettings();
+			
 			new Notice(`成功导入 ${newItems.length} 个正则表达式`);
 			return true;
 		} catch (error) {
@@ -814,9 +306,14 @@ export default class RegexSearchPlugin extends Plugin {
 				return false;
 			}
 			
-			// 快速检查隐藏文件
-			if (!this.settings.includeHiddenFiles && file.name.charCodeAt(0) === 46) { // '.'的ASCII码
-				return false;
+			// 检查隐藏文件和隐藏目录（路径中任意部分以 . 开头）
+			if (!this.settings.includeHiddenFiles) {
+				const pathParts = file.path.split('/');
+				for (const part of pathParts) {
+					if (part.charCodeAt(0) === 46) { // '.'的ASCII码
+						return false;
+					}
+				}
 			}
 			
 			// 检查文件大小（预过滤）
@@ -1020,12 +517,12 @@ export default class RegexSearchPlugin extends Plugin {
 		const flags = regex.flags;
 		
 		return flags.includes('m') || 
-			   /\\[1-9]/.test(pattern) ||
-			   pattern.includes('\\n') || 
-			   pattern.includes('\\r') ||
-			   (pattern.includes('\\s') && (pattern.includes('.*') || pattern.includes('.+'))) ||
-			   pattern.includes('.*') || 
-			   pattern.includes('.+');
+			/\\[1-9]/.test(pattern) ||
+			pattern.includes('\\n') || 
+			pattern.includes('\\r') ||
+			(pattern.includes('\\s') && (pattern.includes('.*') || pattern.includes('.+'))) ||
+			pattern.includes('.*') || 
+			pattern.includes('.+');
 	}
 
 
@@ -1054,15 +551,12 @@ export default class RegexSearchPlugin extends Plugin {
 			}
 			
 			// 启动超时计时器
-			const timeoutPromise = this.currentSearchTask.start();
+			this.currentSearchTask.startTimeout();
 			
 			// 执行搜索
-			const searchPromise = this.performVaultSearchWithLiveResults(
+			await this.performVaultSearchWithLiveResults(
 				filteredFiles, pattern, flags, progressCallback, resultCallback, signal
 			);
-			
-			// 等待搜索完成或超时
-			await Promise.race([searchPromise, timeoutPromise]);
 			
 			this.currentSearchTask.complete();
 			
@@ -1168,18 +662,15 @@ export default class RegexSearchPlugin extends Plugin {
 			const filteredFiles = this.filterFiles(files);
 			const results: SearchResult[] = [];
 			
-			if (filteredFiles.length === 0) {
+		if (filteredFiles.length === 0) {
 				return results;
 			}
 			
 			// 启动超时计时器
-			const timeoutPromise = this.currentSearchTask.start();
+			this.currentSearchTask.startTimeout();
 			
 			// 执行搜索
-			const searchPromise = this.performVaultSearch(filteredFiles, pattern, flags, results, progressCallback, signal);
-			
-			// 等待搜索完成或超时
-			await Promise.race([searchPromise, timeoutPromise]);
+			await this.performVaultSearch(filteredFiles, pattern, flags, results, progressCallback, signal);
 			
 			this.currentSearchTask.complete();
 			
@@ -1347,14 +838,11 @@ export default class RegexSearchPlugin extends Plugin {
 				};
 			}
 			
-			// 启动超时计时器
-			const timeoutPromise = this.currentSearchTask.start();
+		// 启动超时计时器
+			this.currentSearchTask.startTimeout();
 			
 			// 执行替换
-			const replacePromise = this.performVaultReplace(filteredFiles, pattern, replacement, flags, results, errors, progressCallback, signal);
-			
-			// 等待替换完成或超时
-			await Promise.race([replacePromise, timeoutPromise]);
+			await this.performVaultReplace(filteredFiles, pattern, replacement, flags, results, errors, progressCallback, signal);
 			
 			this.currentSearchTask.complete();
 			
@@ -1439,7 +927,7 @@ export default class RegexSearchPlugin extends Plugin {
 	clearSearchHistory() {
 		this.searchHistory.clear();
 		this.settings.searchHistory = [];
-		this.saveSettings().catch(err => console.error('Failed to save settings:', err));
+		void this.saveSettings();
 	}
 }
 
@@ -1535,14 +1023,10 @@ class QuickSearchModal extends Modal {
 				const matchEl = fileEl.createDiv('quick-search-match');
 				matchEl.createEl('span', { text: `第${match.line}行: `, cls: 'quick-search-line' });
 				matchEl.createEl('span', { text: match.lineText, cls: 'quick-search-text' });
-
-			matchEl.addEventListener('click', async () => {
-				try {
-					await this.jumpToMatch(match);
-				} catch (error) {
-					console.error('Failed to jump to match:', error);
-				}
-			});
+				
+				matchEl.addEventListener('click', () => {
+					void this.jumpToMatch(match);
+				});
 			});
 		});
 	}
@@ -1600,8 +1084,10 @@ class RegexSearchModal extends Modal {
 
 	// 状态管理方法
 	private canTransitionTo(newState: SearchState): boolean {
-		const transition = Object.values(STATE_TRANSITIONS).find(t => t.to === newState);
-		return transition ? transition.from.includes(this.currentState) : false;
+		// 修复：使用 some() 遍历所有规则，而不是 find() 只取第一个
+		return Object.values(STATE_TRANSITIONS).some(
+			t => t.to === newState && t.from.includes(this.currentState)
+		);
 	}
 
 	private transitionToState(newState: SearchState, action?: string): boolean {
@@ -1702,8 +1188,8 @@ class RegexSearchModal extends Modal {
 			try {
 				// 构建当前标志
 				let flags = 'g';
-			const caseSensitiveToggle = this.containerEl.querySelector('.regex-options-container input:nth-of-type(1)') as HTMLInputElement;
-			const multilineToggle = this.containerEl.querySelector('.regex-options-container input:nth-of-type(2)') as HTMLInputElement;
+			const caseSensitiveToggle = this.containerEl.querySelector<HTMLInputElement>('.regex-options-container input:nth-of-type(1)');
+			const multilineToggle = this.containerEl.querySelector<HTMLInputElement>('.regex-options-container input:nth-of-type(2)');
 				
 				if (caseSensitiveToggle && !caseSensitiveToggle.checked) {
 					flags += 'i';
@@ -1730,7 +1216,7 @@ class RegexSearchModal extends Modal {
 		this.modalEl.addClass('regex-search-modal');
 		
 		// 创建标题
-		contentEl.createEl('h2', {
+		contentEl.createEl('h2', { 
 			text: this.currentFile ? `🔍 在 ${this.currentFile.name} 中搜索` : '🎯 正则表达式搜索',
 			cls: 'regex-search-title'
 		});
@@ -2038,8 +1524,12 @@ class RegexSearchModal extends Modal {
 		};
 
 		// 绑定事件
-		searchButton.addEventListener('click', performSearch);
-		replaceButton.addEventListener('click', performReplace);
+		searchButton.addEventListener('click', () => {
+			void performSearch();
+		});
+		replaceButton.addEventListener('click', () => {
+			void performReplace();
+		});
 		cancelButton.addEventListener('click', cancelSearch);
 		clearButton.addEventListener('click', clearResults);
 
@@ -2048,10 +1538,10 @@ class RegexSearchModal extends Modal {
 			if (e.key === 'Enter') {
 				if (e.ctrlKey || e.metaKey) {
 					e.preventDefault();
-					performReplace();
+					void performReplace();
 				} else {
 					e.preventDefault();
-					performSearch();
+					void performSearch();
 				}
 			} else if (e.key === 'Escape') {
 				if (this.isOperating()) {
@@ -2067,9 +1557,9 @@ class RegexSearchModal extends Modal {
 	}
 
 	private updateButtonStates() {
-		const searchButton = this.containerEl.querySelector('.regex-search-button') as HTMLButtonElement;
-		const replaceButton = this.containerEl.querySelector('.regex-replace-button') as HTMLButtonElement;
-		const cancelButton = this.containerEl.querySelector('.regex-cancel-button') as HTMLButtonElement;
+		const searchButton = this.containerEl.querySelector<HTMLButtonElement>('.regex-search-button');
+		const replaceButton = this.containerEl.querySelector<HTMLButtonElement>('.regex-replace-button');
+		const cancelButton = this.containerEl.querySelector<HTMLButtonElement>('.regex-cancel-button');
 		
 		const isOperating = this.isOperating();
 		if (searchButton) searchButton.disabled = isOperating;
@@ -2180,12 +1670,8 @@ class RegexSearchModal extends Modal {
 			this.renderMatchContent(contentEl, match);
 
 			// 点击跳转
-			matchEl.addEventListener('click', async () => {
-				try {
-					await this.jumpToMatch(match);
-				} catch (error) {
-					console.error('Failed to jump to match:', error);
-				}
+			matchEl.addEventListener('click', () => {
+				void this.jumpToMatch(match);
 			});
 		});
 	}
@@ -2266,12 +1752,12 @@ class RegexSearchModal extends Modal {
 			setTimeout(() => {
 				try {
 					editor.setCursor(line, column);
-				} catch {
-					// 忽略错误，可能是编辑器已关闭
-				}
+			} catch {
+				// 忽略错误，可能是编辑器已关闭
+			}
 			}, PLUGIN_CONFIG.HIGHLIGHT_DURATION);
-		} catch {
-			// 忽略错误，可能是编辑器已关闭
+		} catch (error) {
+			console.error('高亮匹配文本时出错:', error);
 		}
 	}
 
@@ -2446,12 +1932,13 @@ class RegexLibraryModal extends Modal {
 
 	private exportLibrary() {
 		const json = this.plugin.exportRegexLibrary();
-		navigator.clipboard.writeText(json).then(() => {
-			new Notice('正则表达式库已复制到剪贴板');
-		}).catch(err => {
-			console.error('Failed to copy to clipboard:', err);
-			new Notice('复制到剪贴板失败');
-		});
+		navigator.clipboard.writeText(json)
+			.then(() => {
+				new Notice('正则表达式库已复制到剪贴板');
+			})
+			.catch((err) => {
+				new Notice('复制失败：' + (err instanceof Error ? err.message : String(err)));
+			});
 	}
 
 	onClose() {
@@ -2461,7 +1948,7 @@ class RegexLibraryModal extends Modal {
 		// 如果有父模态框，重新打开它
 		if (this.parentModal) {
 			setTimeout(() => {
-				this.parentModal!.open();
+				this.parentModal.open();
 			}, 100);
 		}
 	}
@@ -2792,10 +2279,10 @@ class RegexSearchSettingTab extends PluginSettingTab {
 
 		// 添加多行模式详细说明
 		const multilineHelp = containerEl.createEl('div', { cls: 'setting-item-description regex-multiline-help' });
-
+		
 		// 使用 DOM API 创建帮助内容
 		multilineHelp.createEl('span', { cls: 'help-title', text: '💡 多行模式说明：' });
-
+		
 		const singleLineItem = multilineHelp.createEl('div', { cls: 'help-item' });
 		singleLineItem.createEl('span', { text: '• ' });
 		singleLineItem.createEl('strong', { text: '单行模式' });
@@ -2823,7 +2310,8 @@ class RegexSearchSettingTab extends PluginSettingTab {
 			.setName('文件扩展名')
 			.setDesc('要搜索的文件扩展名（用逗号分隔）')
 			.addText(text => text
-				.setPlaceholder('md,txt,json,js,ts')
+        // eslint-disable-next-line obsidianmd/ui/sentence-case
+				.setPlaceholder('例如：md, txt, json, js, ts')
 				.setValue(this.plugin.settings.fileExtensions.join(','))
 				.onChange(async (value) => {
 					const extensions = value.split(',').map(ext => ext.trim()).filter(ext => ext.length > 0);
@@ -2936,9 +2424,9 @@ class RegexSearchSettingTab extends PluginSettingTab {
 			.addButton(button => button
 				.setButtonText('🗑️ 清空历史')
 				.setWarning()
-				.onClick(() => {
-					this.plugin.clearSearchHistory();
-					new Notice('搜索历史已清空');
-				}));
+			.onClick(() => {
+				this.plugin.clearSearchHistory();
+				new Notice('搜索历史已清空');
+			}));
 	}
 }

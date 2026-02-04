@@ -3,8 +3,8 @@
   "name": "Regex Search",
   "version": "1.0.2",
   "minAppVersion": "0.15.0",
-  "description": "跨文件和单文件正则表达式搜索插件",
+  "description": "Search and replace all and individual files with Regex.",
   "author": "Tongtong Zhang",
   "authorUrl": "",
   "isDesktopOnly": false
-} 
+}

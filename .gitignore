@@ -105,3 +105,6 @@ dist
 main.js
 data.json
 *.js.map
+
+# AI Agents
+.sisyphus/
