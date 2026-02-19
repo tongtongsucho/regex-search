@@ -2310,7 +2310,6 @@ class RegexSearchSettingTab extends PluginSettingTab {
 			.setName('文件扩展名')
 			.setDesc('要搜索的文件扩展名（用逗号分隔）')
 			.addText(text => text
-        // eslint-disable-next-line obsidianmd/ui/sentence-case
 				.setPlaceholder('例如：md, txt, json, js, ts')
 				.setValue(this.plugin.settings.fileExtensions.join(','))
 				.onChange(async (value) => {
